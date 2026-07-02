@@ -28,16 +28,23 @@ type Scheduler struct {
 	wg      sync.WaitGroup
 
 	retryAgent Decider
+
+	// ---- Rate limiting state ----
+	defaultRateLimit *TenantRateLimit          // default policy for tenants that don't have an override
+	tenantLimits     map[string]TenantRateLimit // tenant-specific config overrides
+	tenantBuckets    map[string]*tokenBucket    // runtime bucket state per tenant
 }
 
 func NewScheduler(workers int, handler JobHandler) *Scheduler {
 	return &Scheduler{
-		tenantQueues: make(map[string]*TenantQueue),
-		jobIndex:     make(map[string]*Job),
-		handler:      handler,
-		workers:      workers,
-		stopCh:       make(chan struct{}),
-		retryAgent:   NewRetryAgent(),
+		tenantQueues:  make(map[string]*TenantQueue),
+		jobIndex:      make(map[string]*Job),
+		handler:       handler,
+		workers:       workers,
+		stopCh:        make(chan struct{}),
+		retryAgent:    NewRetryAgent(),
+		tenantLimits:  make(map[string]TenantRateLimit),
+		tenantBuckets: make(map[string]*tokenBucket),
 	}
 }
 
@@ -47,19 +54,54 @@ func (s *Scheduler) SetDecider(d Decider) {
 	s.retryAgent = d
 }
 
-// Submit enqueues a job under its tenant's isolated queue.
-func (s *Scheduler) Submit(job *Job) {
+// SetDefaultRateLimit sets the default token-bucket policy applied to tenants
+// that do not have an explicit override. Example: rate=5, capacity=10 means
+// 5 jobs/sec with burst up to 10.
+func (s *Scheduler) SetDefaultRateLimit(rate float64, capacity int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.defaultRateLimit = &TenantRateLimit{
+		Rate:     rate,
+		Capacity: capacity,
+	}
+}
+
+// SetTenantRateLimit sets/overrides the token-bucket policy for one tenant.
+func (s *Scheduler) SetTenantRateLimit(tenantID string, rate float64, capacity int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.tenantLimits[tenantID] = TenantRateLimit{
+		Rate:     rate,
+		Capacity: capacity,
+	}
+
+	// Reset bucket so new config takes effect immediately.
+	s.tenantBuckets[tenantID] = newTokenBucket(rate, capacity)
+}
+
+// Submit enqueues a job under its tenant's isolated queue.
+// It first enforces tenant-level token-bucket rate limiting.
+// Returns ErrRateLimited when the tenant has exceeded its allowed submission rate.
+func (s *Scheduler) Submit(job *Job) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+
+	// Enforce tenant token-bucket rate limit before accepting the job.
+	if !s.allowTenantSubmission(job.TenantID, now) {
+		return ErrRateLimited
+	}
+
 	if job.CreatedAt.IsZero() {
-		job.CreatedAt = time.Now()
+		job.CreatedAt = now
 	}
 	if job.Status == "" {
 		job.Status = StatusPending
 	}
 	if job.NextRunAt.IsZero() {
-		job.NextRunAt = time.Now()
+		job.NextRunAt = now
 	}
 
 	tq, ok := s.tenantQueues[job.TenantID]
@@ -70,6 +112,34 @@ func (s *Scheduler) Submit(job *Job) {
 	}
 	tq.Push(job)
 	s.jobIndex[job.ID] = job
+	return nil
+}
+
+// allowTenantSubmission finds/creates the tenant's token bucket and attempts
+// to consume one token. If no default or tenant-specific rate limit exists,
+// submissions are treated as unlimited.
+func (s *Scheduler) allowTenantSubmission(tenantID string, now time.Time) bool {
+	// Reuse existing bucket if present.
+	if bucket, ok := s.tenantBuckets[tenantID]; ok {
+		return bucket.allow(now)
+	}
+
+	// Tenant-specific override takes precedence.
+	if cfg, ok := s.tenantLimits[tenantID]; ok {
+		bucket := newTokenBucket(cfg.Rate, cfg.Capacity)
+		s.tenantBuckets[tenantID] = bucket
+		return bucket.allow(now)
+	}
+
+	// Otherwise use default config if one exists.
+	if s.defaultRateLimit != nil {
+		bucket := newTokenBucket(s.defaultRateLimit.Rate, s.defaultRateLimit.Capacity)
+		s.tenantBuckets[tenantID] = bucket
+		return bucket.allow(now)
+	}
+
+	// No limiter configured => unlimited submissions.
+	return true
 }
 
 func (s *Scheduler) GetJob(id string) (*Job, bool) {
