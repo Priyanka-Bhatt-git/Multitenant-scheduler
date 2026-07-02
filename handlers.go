@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync/atomic"
 
@@ -27,6 +28,7 @@ func (s *Server) SubmitJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	var req submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -45,7 +47,15 @@ func (s *Server) SubmitJob(w http.ResponseWriter, r *http.Request) {
 		Priority:   req.Priority,
 		MaxRetries: req.MaxRetries,
 	}
-	s.Scheduler.Submit(job)
+
+	if err := s.Scheduler.Submit(job); err != nil {
+		if errors.Is(err, scheduler.ErrRateLimited) {
+			http.Error(w, "tenant submission rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		http.Error(w, "failed to submit job", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(job)
