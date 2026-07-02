@@ -18,6 +18,15 @@ func main() {
 	}
 
 	sched := scheduler.NewScheduler(4, handler)
+
+	// Default rate limit for all tenants:
+	// 5 job submissions / second, with burst up to 10.
+	sched.SetDefaultRateLimit(5, 10)
+
+	// Optional tenant-specific override example:
+	// premium-tenant can submit 20 jobs/sec with burst 40.
+	sched.SetTenantRateLimit("premium-tenant", 20, 40)
+
 	sched.Start()
 	defer sched.Stop()
 
